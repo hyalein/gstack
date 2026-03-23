@@ -72,7 +72,7 @@ interface TemplateContext {
 }
 
 function isGeneratedHost(host: Host): host is 'codex' | 'copilot' {
-  return host !== 'claude';
+  return host === 'codex' || host === 'copilot';
 }
 
 function generatedSkillsRoot(host: Host): string | null {
