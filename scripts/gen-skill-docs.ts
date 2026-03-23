@@ -19,20 +19,22 @@ const DRY_RUN = process.argv.includes('--dry-run');
 
 // ─── Template Context ───────────────────────────────────────
 
-type Host = 'claude' | 'codex';
+type Host = 'claude' | 'codex' | 'copilot';
 
 const HOST_ARG = process.argv.find(a => a.startsWith('--host'));
 const HOST: Host = (() => {
   if (!HOST_ARG) return 'claude';
   const val = HOST_ARG.includes('=') ? HOST_ARG.split('=')[1] : process.argv[process.argv.indexOf(HOST_ARG) + 1];
   if (val === 'codex' || val === 'agents') return 'codex';
+  if (val === 'copilot' || val === 'github') return 'copilot';
   if (val === 'claude') return 'claude';
-  throw new Error(`Unknown host: ${val}. Use claude, codex, or agents.`);
+  throw new Error(`Unknown host: ${val}. Use claude, codex, copilot, agents, or github.`);
 })();
 
 interface HostPaths {
   skillRoot: string;
   localSkillRoot: string;
+  skillsDir: string;
   binDir: string;
   browseDir: string;
 }
@@ -41,14 +43,23 @@ const HOST_PATHS: Record<Host, HostPaths> = {
   claude: {
     skillRoot: '~/.claude/skills/gstack',
     localSkillRoot: '.claude/skills/gstack',
+    skillsDir: '.claude/skills',
     binDir: '~/.claude/skills/gstack/bin',
     browseDir: '~/.claude/skills/gstack/browse/dist',
   },
   codex: {
     skillRoot: '$GSTACK_ROOT',
     localSkillRoot: '.agents/skills/gstack',
+    skillsDir: '.agents/skills',
     binDir: '$GSTACK_BIN',
     browseDir: '$GSTACK_BROWSE',
+  },
+  copilot: {
+    skillRoot: '.github/skills/gstack',
+    localSkillRoot: '.github/skills/gstack',
+    skillsDir: '.github/skills',
+    binDir: '.github/skills/gstack/bin',
+    browseDir: '.github/skills/gstack/browse/dist',
   },
 };
 
@@ -58,6 +69,16 @@ interface TemplateContext {
   benefitsFrom?: string[];
   host: Host;
   paths: HostPaths;
+}
+
+function isGeneratedHost(host: Host): host is 'codex' | 'copilot' {
+  return host !== 'claude';
+}
+
+function generatedSkillsRoot(host: Host): string | null {
+  if (host === 'codex') return path.join(ROOT, '.agents', 'skills');
+  if (host === 'copilot') return path.join(ROOT, '.github', 'skills');
+  return null;
 }
 
 // ─── Shared Design Constants ────────────────────────────────
@@ -918,7 +939,7 @@ function generateDesignReviewLite(ctx: TemplateContext): string {
   const litmusList = OPENAI_LITMUS_CHECKS.map((item, i) => `${i + 1}. ${item}`).join(' ');
   const rejectionList = OPENAI_HARD_REJECTIONS.map((item, i) => `${i + 1}. ${item}`).join(' ');
   // Codex block only for Claude host
-  const codexBlock = ctx.host === 'codex' ? '' : `
+  const codexBlock = ctx.host === 'claude' ? `
 
 7. **Codex design voice** (optional, automatic if available):
 
@@ -940,7 +961,7 @@ cat "$TMPERR_DRL" && rm -f "$TMPERR_DRL"
 
 **Error handling:** All errors are non-blocking. On auth failure, timeout, or empty response — skip with a brief note and continue.
 
-Present Codex output under a \`CODEX (design):\` header, merged with the checklist findings above.`;
+Present Codex output under a \`CODEX (design):\` header, merged with the checklist findings above.` : '';
 
   return `## Design Review (conditional, diff-scoped)
 
@@ -2152,8 +2173,8 @@ Error handling: all non-blocking. On failure, skip and continue.`;
 }
 
 function generateCodexSecondOpinion(ctx: TemplateContext): string {
-  // Codex host: strip entirely — Codex should never invoke itself
-  if (ctx.host === 'codex') return '';
+  // Generated hosts strip Codex recursion entirely — only Claude should invoke it
+  if (ctx.host !== 'claude') return '';
 
   return `## Phase 3.5: Cross-Model Second Opinion (optional)
 
@@ -2239,8 +2260,8 @@ If A: revise the premise and note the revision. If B: proceed (and note that the
 }
 
 function generateAdversarialStep(ctx: TemplateContext): string {
-  // Codex host: strip entirely — Codex should never invoke itself
-  if (ctx.host === 'codex') return '';
+  // Generated hosts strip Codex recursion entirely — only Claude should invoke it
+  if (ctx.host !== 'claude') return '';
 
   const isShip = ctx.skillName === 'ship';
   const stepNum = isShip ? '3.8' : '5.7';
@@ -2383,8 +2404,8 @@ High-confidence findings (agreed on by multiple sources) should be prioritized f
 }
 
 function generateCodexPlanReview(ctx: TemplateContext): string {
-  // Codex host: strip entirely — Codex should never invoke itself
-  if (ctx.host === 'codex') return '';
+  // Generated hosts strip Codex recursion entirely — only Claude should invoke it
+  if (ctx.host !== 'claude') return '';
 
   return `## Outside Voice — Independent Plan Challenge (optional, recommended)
 
@@ -2545,8 +2566,8 @@ If you want to persist deploy settings for future runs, suggest the user run \`/
 // ─── Design Outside Voices (parallel Codex + Claude subagent) ───────
 
 function generateDesignOutsideVoices(ctx: TemplateContext): string {
-  // Codex host: strip entirely — Codex should never invoke itself
-  if (ctx.host === 'codex') return '';
+  // Generated hosts strip Codex recursion entirely — only Claude should invoke it
+  if (ctx.host !== 'claude') return '';
 
   const rejectionList = OPENAI_HARD_REJECTIONS.map((item, i) => `${i + 1}. ${item}`).join('\n');
   const litmusList = OPENAI_LITMUS_CHECKS.map((item, i) => `${i + 1}. ${item}`).join('\n');
@@ -2835,7 +2856,7 @@ function codexSkillName(skillDir: string): string {
 }
 
 /**
- * Transform frontmatter for Codex: keep only name + description.
+ * Transform frontmatter for generated hosts: keep only name + description.
  * Strips allowed-tools, hooks, version, and all other fields.
  * Handles multiline block scalar descriptions (YAML | syntax).
  */
@@ -2934,10 +2955,12 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
   // Determine skill directory relative to ROOT
   const skillDir = path.relative(ROOT, path.dirname(tmplPath));
 
-  // For codex host, route output to .agents/skills/{codexSkillName}/SKILL.md
-  if (host === 'codex') {
+  // For generated hosts, route output to host-specific skills/{codexSkillName}/SKILL.md
+  if (isGeneratedHost(host)) {
     const codexName = codexSkillName(skillDir === '.' ? '' : skillDir);
-    const outputDir = path.join(ROOT, '.agents', 'skills', codexName);
+    const skillsRoot = generatedSkillsRoot(host);
+    if (!skillsRoot) throw new Error(`No generated skills root for host: ${host}`);
+    const outputDir = path.join(skillsRoot, codexName);
     fs.mkdirSync(outputDir, { recursive: true });
     outputPath = path.join(outputDir, 'SKILL.md');
   }
@@ -2967,8 +2990,8 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
     throw new Error(`Unresolved placeholders in ${relTmplPath}: ${remaining.join(', ')}`);
   }
 
-  // For codex host: transform frontmatter and replace Claude-specific paths
-  if (host === 'codex') {
+  // For generated hosts: transform frontmatter and replace Claude-specific paths
+  if (isGeneratedHost(host)) {
     // Extract hook safety prose BEFORE transforming frontmatter (which strips hooks)
     const safetyProse = extractHookSafetyProse(tmplContent);
 
@@ -2984,8 +3007,8 @@ function processTemplate(tmplPath: string, host: Host = 'claude'): { outputPath:
     // Replace remaining hardcoded Claude paths with host-appropriate paths
     content = content.replace(/~\/\.claude\/skills\/gstack/g, ctx.paths.skillRoot);
     content = content.replace(/\.claude\/skills\/gstack/g, ctx.paths.localSkillRoot);
-    content = content.replace(/\.claude\/skills\/review/g, '.agents/skills/gstack/review');
-    content = content.replace(/\.claude\/skills/g, '.agents/skills');
+    content = content.replace(/\.claude\/skills\/review/g, `${ctx.paths.localSkillRoot}/review`);
+    content = content.replace(/\.claude\/skills/g, ctx.paths.skillsDir);
   }
 
   // Prepend generated header (after frontmatter)
@@ -3019,8 +3042,8 @@ function findTemplates(): string[] {
 let hasChanges = false;
 
 for (const tmplPath of findTemplates()) {
-  // Skip /codex skill for codex host (self-referential — it's a Claude wrapper around codex exec)
-  if (HOST === 'codex') {
+  // Skip /codex skill for generated hosts (self-referential outside Claude)
+  if (isGeneratedHost(HOST)) {
     const dir = path.basename(path.dirname(tmplPath));
     if (dir === 'codex') continue;
   }
