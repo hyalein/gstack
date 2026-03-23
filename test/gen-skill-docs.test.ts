@@ -1,4 +1,4 @@
-import { describe, test, expect } from 'bun:test';
+import { beforeAll, describe, test, expect } from 'bun:test';
 import { COMMAND_DESCRIPTIONS } from '../browse/src/commands';
 import { SNAPSHOT_FLAGS } from '../browse/src/snapshot';
 import * as fs from 'fs';
@@ -6,6 +6,17 @@ import * as path from 'path';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const MAX_SKILL_DESCRIPTION_LENGTH = 1024;
+
+beforeAll(() => {
+  // .agents/ and .github/ generated skills are gitignored — create the generated
+  // host outputs once up front so fixture reads work from a clean checkout.
+  Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'codex'], {
+    cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
+  });
+  Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'copilot'], {
+    cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
+  });
+});
 
 function extractDescription(content: string): string {
   const fmEnd = content.indexOf('\n---', 4);
@@ -900,11 +911,6 @@ describe('DESIGN_REVIEW_LITE extended with Codex', () => {
 describe('Codex generation (--host codex)', () => {
   const AGENTS_DIR = path.join(ROOT, '.agents', 'skills');
 
-  // .agents/ is gitignored (v0.11.2.0) — generate on demand for tests
-  Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'codex'], {
-    cwd: ROOT, stdout: 'pipe', stderr: 'pipe',
-  });
-
   // Dynamic discovery of expected Codex skills: all templates except /codex
   const CODEX_SKILLS = (() => {
     const skills: Array<{ dir: string; codexName: string }> = [];
@@ -1170,6 +1176,70 @@ describe('Codex generation (--host codex)', () => {
   });
 });
 
+describe('Copilot generation (--host copilot)', () => {
+  const COPILOT_DIR = path.join(ROOT, '.github', 'skills');
+
+  const COPILOT_SKILLS = (() => {
+    const skills: Array<{ dir: string; generatedName: string }> = [];
+    if (fs.existsSync(path.join(ROOT, 'SKILL.md.tmpl'))) {
+      skills.push({ dir: '.', generatedName: 'gstack' });
+    }
+    for (const entry of fs.readdirSync(ROOT, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+      if (entry.name === 'codex') continue;
+      if (!fs.existsSync(path.join(ROOT, entry.name, 'SKILL.md.tmpl'))) continue;
+      const generatedName = entry.name.startsWith('gstack-') ? entry.name : `gstack-${entry.name}`;
+      skills.push({ dir: entry.name, generatedName });
+    }
+    return skills;
+  })();
+
+  test('--host copilot generates correct output paths', () => {
+    for (const skill of COPILOT_SKILLS) {
+      const skillMd = path.join(COPILOT_DIR, skill.generatedName, 'SKILL.md');
+      expect(fs.existsSync(skillMd)).toBe(true);
+    }
+  });
+
+  test('Copilot output rewrites Claude paths to .github/skills', () => {
+    const content = fs.readFileSync(path.join(COPILOT_DIR, 'gstack-review', 'SKILL.md'), 'utf-8');
+    expect(content).not.toContain('.claude/skills');
+    expect(content).not.toContain('~/.claude/');
+    expect(content).toContain('.github/skills/gstack/review/checklist.md');
+    expect(content).toContain('.github/skills/gstack/bin/gstack-config');
+    expect(content).not.toContain('.github/skills/gstack-review/checklist.md');
+  });
+
+  test('Copilot output does not include Codex runtime root or nested Codex blocks', () => {
+    const content = fs.readFileSync(path.join(COPILOT_DIR, 'gstack-ship', 'SKILL.md'), 'utf-8');
+    expect(content).not.toContain('$GSTACK_ROOT');
+    expect(content).not.toContain('$HOME/.codex/skills/gstack');
+    expect(content).not.toContain('Codex design voice');
+    expect(content).not.toContain('codex review --base');
+  });
+
+  test('/codex skill excluded from Copilot output', () => {
+    expect(fs.existsSync(path.join(COPILOT_DIR, 'gstack-codex', 'SKILL.md'))).toBe(false);
+    expect(fs.existsSync(path.join(COPILOT_DIR, 'gstack-codex'))).toBe(false);
+  });
+
+  test('--host github alias produces same output as --host copilot', () => {
+    const copilotResult = Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'copilot', '--dry-run'], {
+      cwd: ROOT,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const githubResult = Bun.spawnSync(['bun', 'run', 'scripts/gen-skill-docs.ts', '--host', 'github', '--dry-run'], {
+      cwd: ROOT,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    expect(copilotResult.exitCode).toBe(0);
+    expect(githubResult.exitCode).toBe(0);
+    expect(copilotResult.stdout.toString()).toBe(githubResult.stdout.toString());
+  });
+});
+
 // ─── Setup script validation ─────────────────────────────────
 // These tests verify the setup script's install layout matches
 // what the generator produces — catching the bug where setup
@@ -1199,7 +1269,7 @@ describe('setup script validation', () => {
     // The Codex install section (section 5) should use the Codex function
     const codexSection = setupContent.slice(
       setupContent.indexOf('# 5. Install for Codex'),
-      setupContent.indexOf('# 6. Create')
+      setupContent.indexOf('# 6. Install for GitHub Copilot')
     );
     expect(codexSection).toContain('create_codex_runtime_root');
     expect(codexSection).toContain('link_codex_skill_dirs');
@@ -1245,15 +1315,16 @@ describe('setup script validation', () => {
     expect(fnBody).toContain('ln -snf "gstack/$skill_name"');
   });
 
-  test('setup supports --host auto|claude|codex|kiro', () => {
+  test('setup supports --host auto|claude|codex|copilot|kiro', () => {
     expect(setupContent).toContain('--host');
-    expect(setupContent).toContain('claude|codex|kiro|auto');
+    expect(setupContent).toContain('claude|codex|copilot|kiro|auto');
   });
 
-  test('auto mode detects claude, codex, and kiro binaries', () => {
+  test('auto mode detects claude, codex, and kiro binaries while leaving Copilot explicit', () => {
     expect(setupContent).toContain('command -v claude');
     expect(setupContent).toContain('command -v codex');
     expect(setupContent).toContain('command -v kiro-cli');
+    expect(setupContent).toContain('explicit --host copilot');
   });
 
   // T1: Sidecar skip guard — prevents .agents/skills/gstack from being linked as a skill
@@ -1279,6 +1350,18 @@ describe('setup script validation', () => {
     expect(setupContent).toContain('kiro-cli');
     expect(setupContent).toContain('KIRO_SKILLS=');
     expect(setupContent).toContain('~/.kiro/skills/gstack');
+  });
+
+  test('setup supports --host copilot with repo-local .github/skills output', () => {
+    const copilotSection = setupContent.slice(
+      setupContent.indexOf('# 6. Install for GitHub Copilot'),
+      setupContent.indexOf('# 7. Install for Kiro CLI')
+    );
+    expect(setupContent).toContain('INSTALL_COPILOT=');
+    expect(setupContent).toContain('ensure_generated_host_skills copilot');
+    expect(setupContent).toContain('create_copilot_sidecar');
+    expect(copilotSection).toContain('.github/skills');
+    expect(copilotSection).toContain('gstack ready (copilot).');
   });
 
   test('create_agents_sidecar links runtime assets', () => {

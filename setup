@@ -14,6 +14,8 @@ INSTALL_SKILLS_DIR="$(dirname "$INSTALL_GSTACK_DIR")"
 BROWSE_BIN="$SOURCE_GSTACK_DIR/browse/dist/browse"
 CODEX_SKILLS="$HOME/.codex/skills"
 CODEX_GSTACK="$CODEX_SKILLS/gstack"
+COPILOT_SKILLS="$SOURCE_GSTACK_DIR/.github/skills"
+COPILOT_GSTACK="$COPILOT_SKILLS/gstack"
 
 IS_WINDOWS=0
 case "$(uname -s)" in
@@ -24,26 +26,29 @@ esac
 HOST="claude"
 while [ $# -gt 0 ]; do
   case "$1" in
-    --host) [ -z "$2" ] && echo "Missing value for --host (expected claude, codex, kiro, or auto)" >&2 && exit 1; HOST="$2"; shift 2 ;;
+    --host) [ -z "$2" ] && echo "Missing value for --host (expected claude, codex, copilot, kiro, or auto)" >&2 && exit 1; HOST="$2"; shift 2 ;;
     --host=*) HOST="${1#--host=}"; shift ;;
     *) shift ;;
   esac
 done
 
 case "$HOST" in
-  claude|codex|kiro|auto) ;;
-  *) echo "Unknown --host value: $HOST (expected claude, codex, kiro, or auto)" >&2; exit 1 ;;
+  claude|codex|copilot|kiro|auto) ;;
+  *) echo "Unknown --host value: $HOST (expected claude, codex, copilot, kiro, or auto)" >&2; exit 1 ;;
 esac
 
 # For auto: detect which agents are installed
 INSTALL_CLAUDE=0
 INSTALL_CODEX=0
+INSTALL_COPILOT=0
 INSTALL_KIRO=0
 if [ "$HOST" = "auto" ]; then
   command -v claude >/dev/null 2>&1 && INSTALL_CLAUDE=1
   command -v codex >/dev/null 2>&1 && INSTALL_CODEX=1
   command -v kiro-cli >/dev/null 2>&1 && INSTALL_KIRO=1
-  # If none found, default to claude
+  # If no CLI hosts found, default to claude. Auto mode intentionally does not
+  # check Copilot because its skills are repo-local under .github/skills, not
+  # a globally detectable CLI install. Use explicit --host copilot instead.
   if [ "$INSTALL_CLAUDE" -eq 0 ] && [ "$INSTALL_CODEX" -eq 0 ] && [ "$INSTALL_KIRO" -eq 0 ]; then
     INSTALL_CLAUDE=1
   fi
@@ -51,6 +56,8 @@ elif [ "$HOST" = "claude" ]; then
   INSTALL_CLAUDE=1
 elif [ "$HOST" = "codex" ]; then
   INSTALL_CODEX=1
+elif [ "$HOST" = "copilot" ]; then
+  INSTALL_COPILOT=1
 elif [ "$HOST" = "kiro" ]; then
   INSTALL_KIRO=1
 fi
@@ -128,25 +135,35 @@ if [ ! -x "$BROWSE_BIN" ]; then
   exit 1
 fi
 
-# 1b. Generate .agents/ Codex skill docs if missing or stale
-# .agents/ is no longer committed — generated at setup time from .tmpl templates.
-# bun run build already does this, but we need it when NEEDS_BUILD=0 (binary is fresh
-# but .agents/ hasn't been generated yet, e.g., fresh clone).
-AGENTS_DIR="$SOURCE_GSTACK_DIR/.agents/skills"
-NEEDS_AGENTS_GEN=0
-if [ ! -d "$AGENTS_DIR" ]; then
-  NEEDS_AGENTS_GEN=1
-elif [ -n "$(find "$SOURCE_GSTACK_DIR" -maxdepth 2 -name 'SKILL.md.tmpl' -newer "$AGENTS_DIR" -print -quit 2>/dev/null)" ]; then
-  NEEDS_AGENTS_GEN=1
-fi
+ensure_generated_host_skills() {
+  local host="$1"
+  local skills_dir="$2"
+  local label="$3"
+  local needs_gen=0
 
-if [ "$NEEDS_AGENTS_GEN" -eq 1 ] && [ "$NEEDS_BUILD" -eq 0 ]; then
-  echo "Generating .agents/ skill docs..."
-  (
-    cd "$SOURCE_GSTACK_DIR"
-    bun install --frozen-lockfile 2>/dev/null || bun install
-    bun run gen:skill-docs --host codex
-  )
+  if [ ! -d "$skills_dir" ]; then
+    needs_gen=1
+  elif [ -n "$(find "$SOURCE_GSTACK_DIR" -maxdepth 2 -name 'SKILL.md.tmpl' -newer "$skills_dir" -print -quit 2>/dev/null)" ]; then
+    needs_gen=1
+  fi
+
+  if [ "$needs_gen" -eq 1 ] && [ "$NEEDS_BUILD" -eq 0 ]; then
+    echo "Generating $label skill docs..."
+    (
+      cd "$SOURCE_GSTACK_DIR"
+      bun install --frozen-lockfile 2>/dev/null || bun install
+      bun run gen:skill-docs --host "$host"
+    )
+  fi
+}
+
+# 1b. Generate non-Claude host skill docs if missing or stale
+AGENTS_DIR="$SOURCE_GSTACK_DIR/.agents/skills"
+if [ "$INSTALL_CODEX" -eq 1 ]; then
+  ensure_generated_host_skills codex "$AGENTS_DIR" ".agents/"
+fi
+if [ "$INSTALL_COPILOT" -eq 1 ]; then
+  ensure_generated_host_skills copilot "$COPILOT_SKILLS" ".github/"
 fi
 
 # 2. Ensure Playwright's Chromium is available
@@ -282,6 +299,34 @@ create_agents_sidecar() {
   done
 }
 
+# ─── Helper: create .github/skills/gstack/ sidecar symlinks ──────────
+# GitHub Copilot reads repo-local skills from .github/skills/.
+create_copilot_sidecar() {
+  local repo_root="$1"
+  local copilot_gstack="$repo_root/.github/skills/gstack"
+  mkdir -p "$copilot_gstack"
+
+  for asset in bin browse review qa; do
+    local src="$SOURCE_GSTACK_DIR/$asset"
+    local dst="$copilot_gstack/$asset"
+    if [ -d "$src" ] || [ -f "$src" ]; then
+      if [ -L "$dst" ] || [ ! -e "$dst" ]; then
+        ln -snf "$src" "$dst"
+      fi
+    fi
+  done
+
+  for file in ETHOS.md; do
+    local src="$SOURCE_GSTACK_DIR/$file"
+    local dst="$copilot_gstack/$file"
+    if [ -f "$src" ]; then
+      if [ -L "$dst" ] || [ ! -e "$dst" ]; then
+        ln -snf "$src" "$dst"
+      fi
+    fi
+  done
+}
+
 # ─── Helper: create a minimal ~/.codex/skills/gstack runtime root ───────────
 # Codex scans ~/.codex/skills recursively. Exposing the whole repo here causes
 # duplicate skills because source SKILL.md files and generated Codex skills are
@@ -369,7 +414,16 @@ if [ "$INSTALL_CODEX" -eq 1 ]; then
   echo "  codex skills: $CODEX_SKILLS"
 fi
 
-# 6. Install for Kiro CLI (copy from .agents/skills, rewrite paths)
+# 6. Install for GitHub Copilot (repo-local .github/skills)
+if [ "$INSTALL_COPILOT" -eq 1 ]; then
+  create_copilot_sidecar "$SOURCE_GSTACK_DIR"
+
+  echo "gstack ready (copilot)."
+  echo "  browse: $BROWSE_BIN"
+  echo "  copilot skills: $COPILOT_SKILLS"
+fi
+
+# 7. Install for Kiro CLI (copy from .agents/skills, rewrite paths)
 if [ "$INSTALL_KIRO" -eq 1 ]; then
   KIRO_SKILLS="$HOME/.kiro/skills"
   AGENTS_DIR="$SOURCE_GSTACK_DIR/.agents/skills"
@@ -425,14 +479,14 @@ if [ "$INSTALL_KIRO" -eq 1 ]; then
   fi
 fi
 
-# 7. Create .agents/ sidecar symlinks for the real Codex skill target.
+# 8. Create .agents/ sidecar symlinks for the real Codex skill target.
 # The root Codex skill ends up pointing at $SOURCE_GSTACK_DIR/.agents/skills/gstack,
 # so the runtime assets must live there for both global and repo-local installs.
 if [ "$INSTALL_CODEX" -eq 1 ]; then
   create_agents_sidecar "$SOURCE_GSTACK_DIR"
 fi
 
-# 8. First-time welcome + legacy cleanup
+# 9. First-time welcome + legacy cleanup
 if [ ! -d "$HOME/.gstack" ]; then
   mkdir -p "$HOME/.gstack"
   echo "  Welcome! Run /gstack-upgrade anytime to stay current."
